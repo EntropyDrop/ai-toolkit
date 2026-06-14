@@ -634,15 +634,18 @@ class SDTrainer(BaseSDTrainProcess):
                 gt_latents = torch.cat([gt_latents] * (pred_latents.shape[0] // gt_latents.shape[0]), dim=0)
             gt_pixel = self.decode_latents_for_minecraft_render_loss(gt_latents)
 
-        uv_crop_size = int(self.get_minecraft_render_loss_config_val("minecraft_render_loss_uv_crop_size", 384))
-        if pred_pixel.shape[2] < uv_crop_size or pred_pixel.shape[3] < uv_crop_size:
-            return None
+        # The UV map (2D unfolded skin) is always exactly in the top-left quadrant (half of height and width)
+        # of the composite target image. We dynamically crop this quadrant and resize it to 384x384.
+        H_pixel, W_pixel = pred_pixel.shape[2], pred_pixel.shape[3]
+        crop_h = H_pixel // 2
+        crop_w = W_pixel // 2
 
-        pred_uv = pred_pixel[:, :3, 0:uv_crop_size, 0:uv_crop_size]
-        gt_uv = gt_pixel[:, :3, 0:uv_crop_size, 0:uv_crop_size]
-        if uv_crop_size != 384:
-            pred_uv = torch.nn.functional.interpolate(pred_uv, size=(384, 384), mode="bilinear", align_corners=False)
-            gt_uv = torch.nn.functional.interpolate(gt_uv, size=(384, 384), mode="bilinear", align_corners=False)
+        pred_uv = pred_pixel[:, :3, 0:crop_h, 0:crop_w]
+        gt_uv = gt_pixel[:, :3, 0:crop_h, 0:crop_w]
+        
+        # Always interpolate to 384x384 so that extract_rgba_skin splits the cells correctly (into 6x6 pixel blocks)
+        pred_uv = torch.nn.functional.interpolate(pred_uv, size=(384, 384), mode="bilinear", align_corners=False)
+        gt_uv = torch.nn.functional.interpolate(gt_uv, size=(384, 384), mode="bilinear", align_corners=False)
 
         skins_pred = self.extract_rgba_skin(pred_uv)
         skins_gt = self.extract_rgba_skin(gt_uv)
