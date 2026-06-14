@@ -583,10 +583,24 @@ class TrainConfig:
         
         self.audio_loss_multiplier = kwargs.get("audio_loss_multiplier", 1.0)
         
+        # Minecraft Differentiable Renderer Loss
+        self.minecraft_render_loss_weight = kwargs.get('minecraft_render_loss_weight', 0.0)
+        self.minecraft_render_loss_views = kwargs.get('minecraft_render_loss_views', 'front,back,left,right')
+        self.minecraft_render_loss_use_lpips = kwargs.get('minecraft_render_loss_use_lpips', True)
+        self.minecraft_render_loss_lambda_lpips = kwargs.get('minecraft_render_loss_lambda_lpips', 1.0)
+        self.minecraft_render_loss_lambda_mse = kwargs.get('minecraft_render_loss_lambda_mse', 1.0)
+        self.minecraft_render_loss_every = kwargs.get('minecraft_render_loss_every', 1)
+        self.minecraft_render_loss_max_timestep = kwargs.get('minecraft_render_loss_max_timestep', None)
+        self.minecraft_render_loss_uv_crop_size = kwargs.get('minecraft_render_loss_uv_crop_size', 384)
+        self.minecraft_render_loss_renderer_path = kwargs.get('minecraft_render_loss_renderer_path', None)
+        self.minecraft_render_loss_mappings_dir = kwargs.get('minecraft_render_loss_mappings_dir', None)
+        self.minecraft_render_loss_bg_color = kwargs.get('minecraft_render_loss_bg_color', (128/255, 128/255, 128/255))
+
         # will throw detailed error when it goes over
         self.max_loss_debug: bool = kwargs.get("max_loss_debug", False)
         # will clip the loss to this amount to prevent wild outliers
         self.max_loss: Optional[float] = kwargs.get("max_loss", None)
+
 
 
 ModelArch = Literal['sd1', 'sd2', 'sd3', 'sdxl', 'pixart', 'pixart_sigma', 'auraflow', 'flux', 'flex1', 'flex2', 'lumina2', 'vega', 'ssd', 'wan21']
