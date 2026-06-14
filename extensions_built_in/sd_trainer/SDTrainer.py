@@ -480,6 +480,172 @@ class SDTrainer(BaseSDTrainProcess):
 
         return output, batch.tensor.to(self.device_torch, dtype=get_torch_dtype(self.train_config.dtype))
 
+
+    @staticmethod
+    def extract_rgba_skin(uv_384):
+        # uv_384: shape (B, 3, 384, 384), range [0, 1]
+        B, C, H, W = uv_384.shape
+        if C != 3 or H != 384 or W != 384:
+            raise ValueError(f"Expected UV crop shape (B, 3, 384, 384), got {tuple(uv_384.shape)}")
+
+        # Reshape to (B, 3, 64, 6, 64, 6). Use reshape because the UV crop can be non-contiguous.
+        blocks = uv_384.reshape(B, 3, 64, 6, 64, 6)
+        # Permute to (B, 3, 64, 64, 6, 6)
+        blocks = blocks.permute(0, 1, 2, 4, 3, 5)
+
+        # The dataset encodes transparent pixels as a white 2x2 marker in the center of each 6x6 cell.
+        center = blocks[..., 2:4, 2:4]  # (B, 3, 64, 64, 2, 2)
+        c_center = center.mean(dim=(-2, -1))  # (B, 3, 64, 64)
+
+        sum_all = blocks.sum(dim=(-2, -1))  # (B, 3, 64, 64)
+        sum_center = center.sum(dim=(-2, -1))
+        c_outer = (sum_all - sum_center) / 32.0  # (B, 3, 64, 64)
+
+        diff = torch.abs(c_center - c_outer).mean(dim=1, keepdim=True)  # (B, 1, 64, 64)
+        alpha = 1.0 - torch.clamp(diff / 0.5, 0.0, 1.0)
+
+        rgba = torch.cat([c_outer, alpha], dim=1)  # (B, 4, 64, 64)
+        return torch.clamp(rgba, 0.0, 1.0)
+
+    def should_apply_minecraft_render_loss(self, timesteps: torch.Tensor):
+        if getattr(self.train_config, "minecraft_render_loss_weight", 0.0) <= 0.0:
+            return False
+        every = max(1, int(getattr(self.train_config, "minecraft_render_loss_every", 1)))
+        if every > 1 and (self.step_num % every) != 0:
+            return False
+        max_timestep = getattr(self.train_config, "minecraft_render_loss_max_timestep", None)
+        if max_timestep is not None and torch.all(timesteps.float() > float(max_timestep)):
+            return False
+        return True
+
+    def get_minecraft_renderer_path(self):
+        configured_path = getattr(self.train_config, "minecraft_render_loss_renderer_path", None)
+        if configured_path:
+            return configured_path
+
+        dir_path = os.path.dirname(os.path.abspath(__file__))
+        for _ in range(6):
+            potential_path = os.path.join(dir_path, "differentiable_minecraft_renderer")
+            if os.path.isdir(potential_path):
+                return potential_path
+            dir_path = os.path.dirname(dir_path)
+        return None
+
+    def get_minecraft_render_loss_fn(self):
+        if getattr(self, "minecraft_render_loss_fn", None) is not None:
+            return self.minecraft_render_loss_fn
+
+        import sys
+        renderer_path = self.get_minecraft_renderer_path()
+        if renderer_path is None:
+            raise FileNotFoundError(
+                "Could not find differentiable_minecraft_renderer. Set "
+                "train.minecraft_render_loss_renderer_path to its directory."
+            )
+        if renderer_path not in sys.path:
+            sys.path.append(renderer_path)
+
+        mappings_dir = getattr(self.train_config, "minecraft_render_loss_mappings_dir", None)
+        if mappings_dir is None:
+            mappings_dir = os.path.join(renderer_path, "mappings")
+        if not os.path.isdir(mappings_dir):
+            raise FileNotFoundError(f"Minecraft renderer mappings directory not found: {mappings_dir}")
+
+        from loss import MinecraftRenderLoss
+        print_acc(f"Initializing MinecraftRenderLoss with mappings_dir: {mappings_dir}")
+        self.minecraft_render_loss_fn = MinecraftRenderLoss(
+            mappings_dir=mappings_dir,
+            bg_color=tuple(getattr(self.train_config, "minecraft_render_loss_bg_color", (128/255, 128/255, 128/255))),
+            use_lpips=self.train_config.minecraft_render_loss_use_lpips,
+            lambda_lpips=self.train_config.minecraft_render_loss_lambda_lpips,
+            lambda_mse=self.train_config.minecraft_render_loss_lambda_mse,
+            views=self.train_config.minecraft_render_loss_views,
+        ).to(self.device_torch)
+        self.minecraft_render_loss_fn.eval()
+        return self.minecraft_render_loss_fn
+
+    def decode_latents_for_minecraft_render_loss(self, latents: torch.Tensor):
+        decode_dtype = getattr(self.sd, "vae_torch_dtype", getattr(self.sd, "torch_dtype", latents.dtype))
+        if hasattr(self.sd, "decode_latents"):
+            pixels = self.sd.decode_latents(latents, device=self.device_torch, dtype=decode_dtype)
+        else:
+            vae = self.sd.vae
+            if vae.device == torch.device("cpu"):
+                vae.to(self.device_torch)
+            latents = latents.to(self.device_torch, dtype=decode_dtype)
+            scaling_factor = getattr(vae.config, "scaling_factor", None)
+            shift_factor = getattr(vae.config, "shift_factor", None)
+            if isinstance(vae.config, dict):
+                scaling_factor = vae.config.get("scaling_factor", scaling_factor)
+                shift_factor = vae.config.get("shift_factor", shift_factor)
+            if scaling_factor is not None:
+                latents = latents / scaling_factor
+            if shift_factor is not None:
+                latents = latents + shift_factor
+            pixels = vae.decode(latents)
+            if hasattr(pixels, "sample"):
+                pixels = pixels.sample
+
+        return torch.clamp((pixels.float() + 1.0) / 2.0, 0.0, 1.0)
+
+    def calculate_minecraft_render_loss(
+            self,
+            noise_pred: torch.Tensor,
+            noisy_latents: torch.Tensor,
+            timesteps: torch.Tensor,
+            batch: 'DataLoaderBatchDTO',
+    ):
+        if len(noise_pred.shape) != 4:
+            return None
+
+        with torch.no_grad():
+            tv = timesteps.to(noise_pred.device, dtype=noise_pred.dtype) / 1000.0
+            while len(tv.shape) < len(noise_pred.shape):
+                tv = tv.unsqueeze(-1)
+
+        pred_latents = noisy_latents.to(noise_pred.device, dtype=noise_pred.dtype) - tv * noise_pred
+        pred_pixel = self.decode_latents_for_minecraft_render_loss(pred_latents)
+
+        with torch.no_grad():
+            gt_latents = batch.latents
+            if gt_latents is None:
+                return None
+            gt_latents = gt_latents.to(pred_latents.device, dtype=pred_latents.dtype)
+            if gt_latents.shape[0] != pred_latents.shape[0]:
+                if pred_latents.shape[0] % gt_latents.shape[0] != 0:
+                    return None
+                gt_latents = torch.cat([gt_latents] * (pred_latents.shape[0] // gt_latents.shape[0]), dim=0)
+            gt_pixel = self.decode_latents_for_minecraft_render_loss(gt_latents)
+
+        uv_crop_size = int(getattr(self.train_config, "minecraft_render_loss_uv_crop_size", 384))
+        if pred_pixel.shape[2] < uv_crop_size or pred_pixel.shape[3] < uv_crop_size:
+            return None
+
+        pred_uv = pred_pixel[:, :3, 0:uv_crop_size, 0:uv_crop_size]
+        gt_uv = gt_pixel[:, :3, 0:uv_crop_size, 0:uv_crop_size]
+        if uv_crop_size != 384:
+            pred_uv = torch.nn.functional.interpolate(pred_uv, size=(384, 384), mode="bilinear", align_corners=False)
+            gt_uv = torch.nn.functional.interpolate(gt_uv, size=(384, 384), mode="bilinear", align_corners=False)
+
+        skins_pred = self.extract_rgba_skin(pred_uv)
+        skins_gt = self.extract_rgba_skin(gt_uv)
+
+        render_loss_fn = self.get_minecraft_render_loss_fn()
+        render_loss_dict = render_loss_fn(skins_pred.float(), skins_gt.float())
+        render_loss_val = render_loss_dict["loss_total"]
+
+        with torch.no_grad():
+            render_scaler = (1.0 - (timesteps.float() / 1000.0)).clamp(0.0, 1.0).to(render_loss_val.device)
+            render_scaler = render_scaler.mean()
+
+        weighted_render_loss = render_loss_val * render_scaler * self.train_config.minecraft_render_loss_weight
+        self.additional_logs['loss/mc_render_total'] = render_loss_val.detach().mean().item()
+        self.additional_logs['loss/mc_render_lpips'] = render_loss_dict['loss_lpips'].detach().mean().item()
+        self.additional_logs['loss/mc_render_mse'] = render_loss_dict['loss_mse'].detach().mean().item()
+        self.additional_logs['loss/mc_render_weighted'] = weighted_render_loss.detach().mean().item()
+        return weighted_render_loss
+
+
     # you can expand these in a child class to make customization easier
     def calculate_loss(
             self,
@@ -937,7 +1103,15 @@ class SDTrainer(BaseSDTrainProcess):
             pred_std = noise_pred.std([2, 3], keepdim=True)
             norm_std_loss = torch.abs(self.train_config.target_norm_std_value - pred_std).mean()
             loss = loss + norm_std_loss
-
+        if self.should_apply_minecraft_render_loss(timesteps):
+            minecraft_render_loss = self.calculate_minecraft_render_loss(
+                noise_pred=noise_pred,
+                noisy_latents=noisy_latents,
+                timesteps=timesteps,
+                batch=batch,
+            )
+            if minecraft_render_loss is not None:
+                additional_loss += minecraft_render_loss.mean()
 
         loss = loss + additional_loss
         
