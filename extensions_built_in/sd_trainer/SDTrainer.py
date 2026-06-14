@@ -523,12 +523,20 @@ class SDTrainer(BaseSDTrainProcess):
         if configured_path:
             return configured_path
 
-        dir_path = os.path.dirname(os.path.abspath(__file__))
-        for _ in range(6):
-            potential_path = os.path.join(dir_path, "differentiable_minecraft_renderer")
-            if os.path.isdir(potential_path):
-                return potential_path
-            dir_path = os.path.dirname(dir_path)
+        search_dirs = [
+            os.path.dirname(os.path.abspath(__file__)),
+            os.getcwd()
+        ]
+        for base_dir in search_dirs:
+            dir_path = base_dir
+            for _ in range(6):
+                potential_path = os.path.join(dir_path, "differentiable_minecraft_renderer")
+                if os.path.isdir(potential_path):
+                    return potential_path
+                parent = os.path.dirname(dir_path)
+                if parent == dir_path:
+                    break
+                dir_path = parent
         return None
 
     def get_minecraft_render_loss_fn(self):
