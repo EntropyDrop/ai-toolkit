@@ -576,7 +576,7 @@ class SDTrainer(BaseSDTrainProcess):
             use_lpips=self.get_minecraft_render_loss_config_val("minecraft_render_loss_use_lpips", True),
             lambda_lpips=self.get_minecraft_render_loss_config_val("minecraft_render_loss_lambda_lpips", 1.0),
             lambda_mse=self.get_minecraft_render_loss_config_val("minecraft_render_loss_lambda_mse", 1.0),
-            views=self.get_minecraft_render_loss_config_val("minecraft_render_loss_views", "front,back,left,right"),
+            views=self.get_minecraft_render_loss_config_val("minecraft_render_loss_views", "static_front,static_back,left_front,right_front"),
         ).to(self.device_torch)
         self.minecraft_render_loss_fn.eval()
         return self.minecraft_render_loss_fn
