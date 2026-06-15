@@ -507,6 +507,80 @@ class SDTrainer(BaseSDTrainProcess):
         rgba = torch.cat([c_outer, alpha], dim=1)  # (B, 4, 64, 64)
         return torch.clamp(rgba, 0.0, 1.0)
 
+    @staticmethod
+    def calculate_uv_block_flatness_loss(uv_384):
+        B, C, H, W = uv_384.shape
+        if C != 3 or H != 384 or W != 384:
+            raise ValueError(f"Expected UV crop shape (B, 3, 384, 384), got {tuple(uv_384.shape)}")
+
+        blocks = uv_384.reshape(B, 3, 64, 6, 64, 6).permute(0, 1, 2, 4, 3, 5)
+
+        outer_mask = torch.ones((1, 1, 1, 1, 6, 6), device=uv_384.device, dtype=uv_384.dtype)
+        outer_mask[..., 2:4, 2:4] = 0.0
+        outer_count = outer_mask.sum().clamp_min(1.0)
+        outer_mean = (blocks * outer_mask).sum(dim=(-2, -1), keepdim=True) / outer_count
+        outer_loss = (((blocks - outer_mean) ** 2) * outer_mask).sum(dim=(-2, -1)) / outer_count
+        outer_loss = outer_loss.mean()
+
+        center = blocks[..., 2:4, 2:4]
+        center_mean = center.mean(dim=(-2, -1), keepdim=True)
+        center_loss = ((center - center_mean) ** 2).mean()
+
+        return outer_loss + center_loss
+
+    @staticmethod
+    def build_skin_palette(skins_gt, max_colors=32, alpha_threshold=0.5, iterations=4):
+        palettes = []
+        max_colors = max(1, int(max_colors))
+        iterations = max(0, int(iterations))
+        luma_weights = torch.tensor([0.299, 0.587, 0.114], device=skins_gt.device, dtype=torch.float32)
+
+        with torch.no_grad():
+            for skin in skins_gt:
+                rgb = skin[:3].permute(1, 2, 0).reshape(-1, 3).float()
+                alpha = skin[3].reshape(-1)
+                colors = rgb[alpha > alpha_threshold]
+                if colors.shape[0] == 0:
+                    colors = rgb
+
+                k = min(max_colors, colors.shape[0])
+                luma = colors @ luma_weights
+                sorted_colors = colors[torch.argsort(luma)]
+                init_idx = torch.linspace(0, sorted_colors.shape[0] - 1, steps=k, device=colors.device).round().long()
+                centers = sorted_colors[init_idx].clone()
+
+                for _ in range(iterations):
+                    distances = torch.cdist(colors.unsqueeze(0), centers.unsqueeze(0)).squeeze(0)
+                    assignments = distances.argmin(dim=1)
+                    sums = torch.zeros_like(centers)
+                    sums.index_add_(0, assignments, colors)
+                    counts = torch.bincount(assignments, minlength=k).to(colors.device, dtype=torch.float32).unsqueeze(1)
+                    centers = torch.where(counts > 0, sums / counts.clamp_min(1.0), centers)
+
+                if k < max_colors:
+                    padding = centers[-1:].expand(max_colors - k, -1)
+                    centers = torch.cat([centers, padding], dim=0)
+                palettes.append(centers)
+
+        return torch.stack(palettes, dim=0)
+
+    @staticmethod
+    def calculate_uv_palette_loss(skins_pred, skins_gt, max_colors=32, alpha_threshold=0.5, iterations=4):
+        palettes = SDTrainer.build_skin_palette(
+            skins_gt,
+            max_colors=max_colors,
+            alpha_threshold=alpha_threshold,
+            iterations=iterations,
+        )
+        pred_rgb = skins_pred[:, :3].permute(0, 2, 3, 1).reshape(skins_pred.shape[0], -1, 3).float()
+        gt_alpha = skins_gt[:, 3].reshape(skins_gt.shape[0], -1)
+        visible = (gt_alpha > alpha_threshold).float()
+
+        distances = ((pred_rgb.unsqueeze(2) - palettes.unsqueeze(1)) ** 2).sum(dim=-1)
+        min_distances = distances.min(dim=2).values
+        per_item_loss = (min_distances * visible).sum(dim=1) / visible.sum(dim=1).clamp_min(1.0)
+        return per_item_loss.mean()
+
     def get_minecraft_render_loss_config_val(self, key, default=None):
         if hasattr(self.train_config, key):
             return getattr(self.train_config, key)
@@ -656,6 +730,39 @@ class SDTrainer(BaseSDTrainProcess):
 
         render_loss_fn = self.get_minecraft_render_loss_fn()
 
+        uv_aux_loss = pred_uv.new_tensor(0.0)
+        uv_block_flatness_weight = self.get_minecraft_render_loss_config_val("minecraft_uv_block_flatness_weight", 0.0)
+        if uv_block_flatness_weight > 0.0:
+            uv_block_flatness_loss = self.calculate_uv_block_flatness_loss(pred_uv)
+            uv_aux_loss = uv_aux_loss + uv_block_flatness_loss * uv_block_flatness_weight
+            self.additional_logs['loss/mc_uv_block_flatness'] = uv_block_flatness_loss.detach().mean().item()
+
+        uv_skin_l1_weight = self.get_minecraft_render_loss_config_val("minecraft_uv_skin_l1_weight", 0.0)
+        if uv_skin_l1_weight > 0.0:
+            uv_skin_l1_loss = torch.nn.functional.l1_loss(skins_pred, skins_gt)
+            uv_aux_loss = uv_aux_loss + uv_skin_l1_loss * uv_skin_l1_weight
+            self.additional_logs['loss/mc_uv_skin_l1'] = uv_skin_l1_loss.detach().mean().item()
+
+        uv_alpha_bce_weight = self.get_minecraft_render_loss_config_val("minecraft_uv_alpha_bce_weight", 0.0)
+        if uv_alpha_bce_weight > 0.0:
+            alpha_pred = skins_pred[:, 3:4].clamp(1e-4, 1.0 - 1e-4)
+            alpha_target = (skins_gt[:, 3:4] > 0.5).to(alpha_pred.dtype)
+            uv_alpha_bce_loss = torch.nn.functional.binary_cross_entropy(alpha_pred, alpha_target)
+            uv_aux_loss = uv_aux_loss + uv_alpha_bce_loss * uv_alpha_bce_weight
+            self.additional_logs['loss/mc_uv_alpha_bce'] = uv_alpha_bce_loss.detach().mean().item()
+
+        uv_palette_weight = self.get_minecraft_render_loss_config_val("minecraft_uv_palette_loss_weight", 0.0)
+        if uv_palette_weight > 0.0:
+            uv_palette_loss = self.calculate_uv_palette_loss(
+                skins_pred,
+                skins_gt,
+                max_colors=self.get_minecraft_render_loss_config_val("minecraft_uv_palette_colors", 32),
+                alpha_threshold=self.get_minecraft_render_loss_config_val("minecraft_uv_palette_alpha_threshold", 0.5),
+                iterations=self.get_minecraft_render_loss_config_val("minecraft_uv_palette_iters", 4),
+            )
+            uv_aux_loss = uv_aux_loss + uv_palette_loss * uv_palette_weight
+            self.additional_logs['loss/mc_uv_palette'] = uv_palette_loss.detach().mean().item()
+
         # Diagnostic check: Save differentiable renders and extracted skins to the samples folder periodically
         debug = self.get_minecraft_render_loss_config_val("minecraft_render_loss_debug", False)
         if debug and self.accelerator.is_main_process and self.step_num % 100 == 0:
@@ -689,7 +796,7 @@ class SDTrainer(BaseSDTrainProcess):
                     print_acc(f"WARNING: Failed to save diagnostic renders: {e}")
 
         render_loss_dict = render_loss_fn(skins_pred.float(), skins_gt.float())
-        render_loss_val = render_loss_dict["loss_total"]
+        render_loss_val = render_loss_dict["loss_total"] + uv_aux_loss
 
         with torch.no_grad():
             timestep_weighting = self.get_minecraft_render_loss_config_val("minecraft_render_loss_timestep_weighting", "low_noise")
@@ -709,6 +816,7 @@ class SDTrainer(BaseSDTrainProcess):
         self.additional_logs['loss/mc_render_total'] = render_loss_val.detach().mean().item()
         self.additional_logs['loss/mc_render_lpips'] = render_loss_dict['loss_lpips'].detach().mean().item()
         self.additional_logs['loss/mc_render_mse'] = render_loss_dict['loss_mse'].detach().mean().item()
+        self.additional_logs['loss/mc_uv_aux'] = uv_aux_loss.detach().mean().item()
         self.additional_logs['loss/mc_render_weighted'] = weighted_render_loss.detach().mean().item()
         return weighted_render_loss
 
