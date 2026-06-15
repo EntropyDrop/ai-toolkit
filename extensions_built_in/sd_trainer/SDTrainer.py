@@ -522,6 +522,9 @@ class SDTrainer(BaseSDTrainProcess):
         every = max(1, int(self.get_minecraft_render_loss_config_val("minecraft_render_loss_every", 1)))
         if every > 1 and (self.step_num % every) != 0:
             return False
+        min_timestep = self.get_minecraft_render_loss_config_val("minecraft_render_loss_min_timestep", None)
+        if min_timestep is not None and torch.all(timesteps.float() < float(min_timestep)):
+            return False
         max_timestep = self.get_minecraft_render_loss_config_val("minecraft_render_loss_max_timestep", None)
         if max_timestep is not None and torch.all(timesteps.float() > float(max_timestep)):
             return False
@@ -576,6 +579,7 @@ class SDTrainer(BaseSDTrainProcess):
             use_lpips=self.get_minecraft_render_loss_config_val("minecraft_render_loss_use_lpips", True),
             lambda_lpips=self.get_minecraft_render_loss_config_val("minecraft_render_loss_lambda_lpips", 1.0),
             lambda_mse=self.get_minecraft_render_loss_config_val("minecraft_render_loss_lambda_mse", 1.0),
+            foreground_weight=self.get_minecraft_render_loss_config_val("minecraft_render_loss_foreground_weight", 0.0),
             views=self.get_minecraft_render_loss_config_val("minecraft_render_loss_views", "static_front,static_back,left_front,right_front"),
         ).to(self.device_torch)
         self.minecraft_render_loss_fn.eval()
@@ -653,7 +657,7 @@ class SDTrainer(BaseSDTrainProcess):
         render_loss_fn = self.get_minecraft_render_loss_fn()
 
         # Diagnostic check: Save differentiable renders and extracted skins to the samples folder periodically
-        debug = True
+        debug = self.get_minecraft_render_loss_config_val("minecraft_render_loss_debug", False)
         if debug and self.accelerator.is_main_process and self.step_num % 100 == 0:
             with torch.no_grad():
                 try:
@@ -688,11 +692,20 @@ class SDTrainer(BaseSDTrainProcess):
         render_loss_val = render_loss_dict["loss_total"]
 
         with torch.no_grad():
-            render_scaler = (1.0 - (timesteps.float() / 1000.0)).clamp(0.0, 1.0).to(render_loss_val.device)
-            render_scaler = render_scaler.mean()
+            timestep_weighting = self.get_minecraft_render_loss_config_val("minecraft_render_loss_timestep_weighting", "low_noise")
+            if timestep_weighting == "constant":
+                render_scaler = torch.tensor(1.0, device=render_loss_val.device)
+            elif timestep_weighting == "mid":
+                t_01 = (timesteps.float() / 1000.0).clamp(0.0, 1.0)
+                render_scaler = (4.0 * t_01 * (1.0 - t_01)).to(render_loss_val.device).mean()
+            else:
+                render_scaler = (1.0 - (timesteps.float() / 1000.0)).clamp(0.0, 1.0).to(render_loss_val.device)
+                render_scaler = render_scaler.mean()
 
         weight = self.get_minecraft_render_loss_config_val("minecraft_render_loss_weight", 0.0)
         weighted_render_loss = render_loss_val * render_scaler * weight
+        self.additional_logs['loss/mc_render_timestep_mean'] = timesteps.detach().float().mean().item()
+        self.additional_logs['loss/mc_render_scaler'] = render_scaler.detach().mean().item()
         self.additional_logs['loss/mc_render_total'] = render_loss_val.detach().mean().item()
         self.additional_logs['loss/mc_render_lpips'] = render_loss_dict['loss_lpips'].detach().mean().item()
         self.additional_logs['loss/mc_render_mse'] = render_loss_dict['loss_mse'].detach().mean().item()
