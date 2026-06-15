@@ -659,9 +659,9 @@ class SDTrainer(BaseSDTrainProcess):
                     sample_folder = os.path.join(self.save_root, 'samples')
                     os.makedirs(sample_folder, exist_ok=True)
                     renderer = render_loss_fn.renderer
-                    # Render 'front' and 'back' views for prediction and ground truth (first batch item)
-                    front_pred = renderer.forward_view(skins_pred[:1], "front")[0] # (4, H, W)
-                    front_gt = renderer.forward_view(skins_gt[:1], "front")[0] # (4, H, W)
+                    diagnostic_view = render_loss_fn.views[0]
+                    pred_render = renderer.forward_view(skins_pred[:1], diagnostic_view)[0] # (4, H, W)
+                    gt_render = renderer.forward_view(skins_gt[:1], diagnostic_view)[0] # (4, H, W)
                     
                     # Convert to PIL and save
                     from torchvision.transforms.functional import to_pil_image
@@ -671,11 +671,11 @@ class SDTrainer(BaseSDTrainProcess):
                     to_pil_image(skins_gt[0].cpu().clamp(0.0, 1.0)).save(
                         os.path.join(sample_folder, f"step_{self.step_num:09d}_extracted_skin_gt.png")
                     )
-                    to_pil_image(front_pred.cpu().clamp(0.0, 1.0)).save(
-                        os.path.join(sample_folder, f"step_{self.step_num:09d}_render_front_pred.png")
+                    to_pil_image(pred_render.cpu().clamp(0.0, 1.0)).save(
+                        os.path.join(sample_folder, f"step_{self.step_num:09d}_render_{diagnostic_view}_pred.png")
                     )
-                    to_pil_image(front_gt.cpu().clamp(0.0, 1.0)).save(
-                        os.path.join(sample_folder, f"step_{self.step_num:09d}_render_front_gt.png")
+                    to_pil_image(gt_render.cpu().clamp(0.0, 1.0)).save(
+                        os.path.join(sample_folder, f"step_{self.step_num:09d}_render_{diagnostic_view}_gt.png")
                     )
                 except Exception as e:
                     print_acc(f"WARNING: Failed to save diagnostic renders: {e}")
