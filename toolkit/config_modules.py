@@ -585,7 +585,7 @@ class TrainConfig:
         
         # Minecraft Differentiable Renderer Loss
         self.minecraft_render_loss_weight = kwargs.get('minecraft_render_loss_weight', 0.0)
-        self.minecraft_render_loss_views = kwargs.get('minecraft_render_loss_views', 'front,back,left,right')
+        self.minecraft_render_loss_views = kwargs.get('minecraft_render_loss_views', 'static_front,static_back,left_front,right_front')
         self.minecraft_render_loss_use_lpips = kwargs.get('minecraft_render_loss_use_lpips', True)
         self.minecraft_render_loss_lambda_lpips = kwargs.get('minecraft_render_loss_lambda_lpips', 1.0)
         self.minecraft_render_loss_lambda_mse = kwargs.get('minecraft_render_loss_lambda_mse', 1.0)
