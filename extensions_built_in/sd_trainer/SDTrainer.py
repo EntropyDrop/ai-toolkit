@@ -653,17 +653,15 @@ class SDTrainer(BaseSDTrainProcess):
         render_loss_fn = self.get_minecraft_render_loss_fn()
 
         # Diagnostic check: Save differentiable renders and extracted skins to the samples folder periodically
-        if self.accelerator.is_main_process and self.step_num % 100 == 0:
+        debug = True
+        if debug and self.accelerator.is_main_process and self.step_num % 100 == 0:
             with torch.no_grad():
                 try:
                     sample_folder = os.path.join(self.save_root, 'samples')
                     os.makedirs(sample_folder, exist_ok=True)
                     renderer = render_loss_fn.renderer
-                    diagnostic_view = render_loss_fn.views[0]
-                    pred_render = renderer.forward_view(skins_pred[:1], diagnostic_view)[0] # (4, H, W)
-                    gt_render = renderer.forward_view(skins_gt[:1], diagnostic_view)[0] # (4, H, W)
                     
-                    # Convert to PIL and save
+                    # Convert to PIL and save extracted skins (once per step)
                     from torchvision.transforms.functional import to_pil_image
                     to_pil_image(skins_pred[0].cpu().clamp(0.0, 1.0)).save(
                         os.path.join(sample_folder, f"step_{self.step_num:09d}_extracted_skin_pred.png")
@@ -671,12 +669,18 @@ class SDTrainer(BaseSDTrainProcess):
                     to_pil_image(skins_gt[0].cpu().clamp(0.0, 1.0)).save(
                         os.path.join(sample_folder, f"step_{self.step_num:09d}_extracted_skin_gt.png")
                     )
-                    to_pil_image(pred_render.cpu().clamp(0.0, 1.0)).save(
-                        os.path.join(sample_folder, f"step_{self.step_num:09d}_render_{diagnostic_view}_pred.png")
-                    )
-                    to_pil_image(gt_render.cpu().clamp(0.0, 1.0)).save(
-                        os.path.join(sample_folder, f"step_{self.step_num:09d}_render_{diagnostic_view}_gt.png")
-                    )
+                    
+                    # Render and save all views
+                    for view_name in render_loss_fn.views:
+                        pred_render = renderer.forward_view(skins_pred[:1], view_name)[0] # (4, H, W)
+                        gt_render = renderer.forward_view(skins_gt[:1], view_name)[0] # (4, H, W)
+                        
+                        to_pil_image(pred_render.cpu().clamp(0.0, 1.0)).save(
+                            os.path.join(sample_folder, f"step_{self.step_num:09d}_render_{view_name}_pred.png")
+                        )
+                        to_pil_image(gt_render.cpu().clamp(0.0, 1.0)).save(
+                            os.path.join(sample_folder, f"step_{self.step_num:09d}_render_{view_name}_gt.png")
+                        )
                 except Exception as e:
                     print_acc(f"WARNING: Failed to save diagnostic renders: {e}")
 
