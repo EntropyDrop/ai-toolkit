@@ -650,8 +650,8 @@ class SDTrainer(BaseSDTrainProcess):
         self.minecraft_render_loss_fn = MinecraftRenderLoss(
             mappings_dir=mappings_dir,
             bg_color=tuple(self.get_minecraft_render_loss_config_val("minecraft_render_loss_bg_color", (128/255, 128/255, 128/255))),
-            use_lpips=self.get_minecraft_render_loss_config_val("minecraft_render_loss_use_lpips", True),
-            lambda_lpips=self.get_minecraft_render_loss_config_val("minecraft_render_loss_lambda_lpips", 1.0),
+            use_lpips=self.get_minecraft_render_loss_config_val("minecraft_render_loss_use_lpips", False),
+            lambda_lpips=self.get_minecraft_render_loss_config_val("minecraft_render_loss_lambda_lpips", 0.0),
             lambda_mse=self.get_minecraft_render_loss_config_val("minecraft_render_loss_lambda_mse", 1.0),
             foreground_weight=self.get_minecraft_render_loss_config_val("minecraft_render_loss_foreground_weight", 0.0),
             views=self.get_minecraft_render_loss_config_val("minecraft_render_loss_views", "static_front,static_back,left_front,right_front"),
@@ -743,6 +743,12 @@ class SDTrainer(BaseSDTrainProcess):
             uv_aux_loss = uv_aux_loss + uv_skin_l1_loss * uv_skin_l1_weight
             self.additional_logs['loss/mc_uv_skin_l1'] = uv_skin_l1_loss.detach().mean().item()
 
+        uv_skin_mse_weight = self.get_minecraft_render_loss_config_val("minecraft_uv_skin_mse_weight", 0.0)
+        if uv_skin_mse_weight > 0.0:
+            uv_skin_mse_loss = torch.nn.functional.mse_loss(skins_pred, skins_gt)
+            uv_aux_loss = uv_aux_loss + uv_skin_mse_loss * uv_skin_mse_weight
+            self.additional_logs['loss/mc_uv_skin_mse'] = uv_skin_mse_loss.detach().mean().item()
+
         uv_alpha_bce_weight = self.get_minecraft_render_loss_config_val("minecraft_uv_alpha_bce_weight", 0.0)
         if uv_alpha_bce_weight > 0.0:
             alpha_pred = skins_pred[:, 3:4].clamp(1e-4, 1.0 - 1e-4)
@@ -811,8 +817,6 @@ class SDTrainer(BaseSDTrainProcess):
 
         weight = self.get_minecraft_render_loss_config_val("minecraft_render_loss_weight", 0.0)
         weighted_render_loss = render_loss_val * render_scaler * weight
-        self.additional_logs['loss/mc_render_timestep_mean'] = timesteps.detach().float().mean().item()
-        self.additional_logs['loss/mc_render_scaler'] = render_scaler.detach().mean().item()
         self.additional_logs['loss/mc_render_total'] = render_loss_val.detach().mean().item()
         self.additional_logs['loss/mc_render_lpips'] = render_loss_dict['loss_lpips'].detach().mean().item()
         self.additional_logs['loss/mc_render_mse'] = render_loss_dict['loss_mse'].detach().mean().item()
