@@ -652,7 +652,7 @@ class SDTrainer(BaseSDTrainProcess):
             bg_color=tuple(self.get_minecraft_render_loss_config_val("minecraft_render_loss_bg_color", (128/255, 128/255, 128/255))),
             use_lpips=self.get_minecraft_render_loss_config_val("minecraft_render_loss_use_lpips", False),
             lambda_lpips=self.get_minecraft_render_loss_config_val("minecraft_render_loss_lambda_lpips", 0.0),
-            lambda_mse=self.get_minecraft_render_loss_config_val("minecraft_render_loss_lambda_mse", 1.0),
+            lambda_mse=self.get_minecraft_render_loss_config_val("minecraft_render_loss_lambda_mse", 0.0),
             foreground_weight=self.get_minecraft_render_loss_config_val("minecraft_render_loss_foreground_weight", 0.0),
             views=self.get_minecraft_render_loss_config_val("minecraft_render_loss_views", "static_front,static_back,left_front,right_front"),
         ).to(self.device_torch)
